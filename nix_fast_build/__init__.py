@@ -66,6 +66,8 @@ class Options:
     skip_cached: bool = False
     eval_workers: int = field(default_factory=multiprocessing.cpu_count)
     max_jobs: int = 0
+    max_builds: int = 0
+    max_transitive_builds: int = 0
     retries: int = 0
     debug: bool = False
     copy_to: str | None = None
@@ -136,6 +138,18 @@ async def parse_args(args: list[str]) -> Options:
         type=int,
         default=None,
         help="Maximum number of build jobs to run in parallel (0 for unlimited)",
+    )
+    parser.add_argument(
+        "--max-builds",
+        type=int,
+        default=0,
+        help="Maximum number of builds (0 for unlimited)",
+    )
+    parser.add_argument(
+        "--max-transitive-builds",
+        type=int,
+        default=0,
+        help="Maximum number of transitive builds (0 for unlimited)",
     )
     parser.add_argument(
         "--option",
@@ -273,6 +287,8 @@ async def parse_args(args: list[str]) -> Options:
         options=options,
         remote_ssh_options=remote_ssh_options,
         max_jobs=a.max_jobs,
+        max_builds=a.max_builds,
+        max_transitive_builds=a.max_transitive_builds,
         nom=not a.no_nom,
         download=not a.no_download,
         debug=a.debug,
@@ -978,6 +994,48 @@ async def run(stack: AsyncExitStack, opts: Options) -> int:
 
     return rc
 
+def builds_within_limit(opts: Options) -> bool:
+    cmd = nix_command(
+        [
+            "build",
+            "--dry-run",
+            "--json",
+            f"{opts.flake_url}#{opts.flake_fragment}"
+        ]
+    )
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    if proc.returncode != 0:
+        die(
+            f"failed to dry run: {shlex.join(cmd)} failed with {proc.returncode}"
+        )
+
+    try:
+        json_data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, OSError) as e:
+        die(
+            f"failed to parse output of {shlex.join(cmd)}: {e}\nGot: {proc.stdout.decode('utf-8', 'replace')}"
+        )
+
+    drv_to_be_built = set()
+    for line in proc.stderr.splitlines():
+        if "will be fetched" in str(line):
+            break
+        if not line.startswith(b"  /nix/store/"):
+            continue
+        drv_to_be_built.add(line.strip())
+
+    drv_top_level = set()
+    for drv in json_data:
+        drv_top_level.add(drv["drvPath"].encode())
+    drv_transitive = drv_to_be_built - drv_top_level
+
+    if len(drv_transitive) > opts.max_transitive_builds > 0:
+        return False
+    elif len(drv_to_be_built) > opts.max_builds > 0:
+        return False
+    else:
+        return True
 
 async def async_main(args: list[str]) -> int:
     opts = await parse_args(args)
@@ -985,6 +1043,10 @@ async def async_main(args: list[str]) -> int:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
+
+    if not builds_within_limit(opts):
+        logger.error("bailing out, build limit exceeded")
+        return 1
 
     stack = AsyncExitStack()
     # using async wait here seems to make the return value skipped in the non-execptional case
